@@ -1,0 +1,151 @@
+# Generative AI and RAG Notes
+
+## 1. What is Generative AI?
+Generative AI is a type of artificial intelligence that creates new content such as text, images, audio, video, and code.
+
+Example: ChatGPT can generate answers to questions, write code, and summarize documents.
+
+## 2. What is an LLM?
+LLM stands for Large Language Model. It is trained on large amounts of text to understand and generate human-like language.
+
+Examples: GPT, Gemini, Claude, and Llama.
+
+## 3. What is a Prompt?
+A prompt is an instruction or question given to an AI model.
+
+Example:
+Explain Python programming in simple English.
+
+A clear prompt usually helps the model produce a more useful response.
+
+## 4. What is LangChain?
+LangChain is a framework for building applications using language models. It provides integrations for chat models, prompts, document loaders, embeddings, retrievers, and other AI components.
+
+## 5. What is a Chat Model?
+A chat model accepts messages or prompts and returns an AI-generated response.
+
+Example using Gemini:
+
+from langchain.chat_models import init_chat_model
+from dotenv import load_dotenv
+
+load_dotenv()
+
+model = init_chat_model(
+    "gemini-3.8-flash",
+    model_provider="google_genai"
+)
+
+response = model.invoke("What is Python?")
+print(response.content)
+
+The model ID must be available to your API account. The API key is stored in the .env file.
+
+## 6. What are Embeddings?
+Embeddings convert text into numerical vectors. These vectors represent semantic information and help find text with similar meanings.
+
+Example:
+"How can I learn Python?"
+and
+"What is the best way to study Python?"
+
+These sentences have similar meanings, so their embeddings may be close together.
+
+## 7. What is a Vector Database?
+A vector database stores vectors and related information. It helps retrieve relevant text based on semantic similarity.
+
+Examples: FAISS, Chroma, and Pinecone.
+
+## 8. What is a Document Loader?
+A document loader reads data from files or other sources and converts it into documents that an application can process.
+
+Examples:
+- TextLoader for TXT files
+- PyPDFLoader for PDF files
+- WebBaseLoader for supported web pages
+
+## 9. What is Text Chunking?
+Text chunking divides a large document into smaller pieces.
+
+Why is it needed?
+- Large documents may exceed a model's context limits.
+- Smaller chunks can improve retrieval relevance.
+- Relevant sections can be sent to the model instead of the entire document.
+
+## 10. What is RAG?
+RAG stands for Retrieval-Augmented Generation.
+
+RAG combines information retrieval with text generation. It allows an AI application to use relevant information from external documents when answering questions.
+
+Example:
+A student uploads college notes and asks, "What is an operating system?"
+
+The RAG application retrieves the relevant section from the notes and uses it to generate an answer.
+
+## 11. How Does RAG Work?
+Step 1: Load documents.
+Step 2: Split documents into chunks.
+Step 3: Convert chunks into embeddings.
+Step 4: Store embeddings in a vector database.
+Step 5: Convert the user's question into an embedding.
+Step 6: Retrieve relevant chunks.
+Step 7: Send the question and retrieved context to the language model.
+Step 8: Return the generated answer.
+
+## 12. What is a Retriever?
+A retriever searches a collection of documents and returns the most relevant results for a query.
+
+A retriever helps the RAG system find useful context before generating an answer.
+
+## 13. What is the Difference Between RAG and Fine-Tuning?
+RAG retrieves relevant information from external sources at query time.
+
+Fine-tuning further trains or adapts a model using examples to influence its behavior or task performance.
+
+RAG is often useful when an application needs to answer questions using documents that change regularly.
+
+## 14. What is an AI Agent?
+An AI agent is a system that can use a language model to decide on actions and interact with tools to accomplish a task.
+
+Examples of tools include calculators, search functions, databases, and APIs.
+
+## 15. What is Temperature?
+Temperature is a model-generation setting that affects how varied the output may be.
+
+Lower temperature generally produces more predictable responses. Higher temperature can produce more varied responses.
+
+## 16. What is an API Key?
+An API key is a credential used to authenticate requests to an AI service.
+
+Store API keys in environment variables or a .env file. Do not publish secret keys on GitHub.
+
+## 17. What is Semantic Search?
+Semantic search finds information based on meaning rather than only exact keyword matches.
+
+For example, a search for "ways to stay fit" may retrieve a document titled "Healthy Exercise Habits."
+
+## 18. What is Hallucination?
+An AI hallucination occurs when a model generates information that is incorrect or unsupported.
+
+RAG can reduce some hallucinations by providing relevant context, but it cannot guarantee that every answer is correct.
+
+## 19. Important RAG Components
+- Documents: The source information.
+- Chunks: Smaller sections of documents.
+- Embeddings: Numerical representations of text.
+- Vector database: Stores and searches vectors.
+- Retriever: Finds relevant chunks.
+- LLM: Generates the final response.
+- Prompt: Gives the model instructions and context.
+
+## 20. Practice Questions
+1. What is Generative AI?
+2. What is an LLM?
+3. Why do we use LangChain?
+4. What are embeddings?
+5. Why is a vector database needed?
+6. Why do we split documents into chunks?
+7. Explain the complete RAG workflow.
+8. What is the difference between RAG and fine-tuning?
+9. What is semantic search?
+10. How can RAG help reduce hallucinations?

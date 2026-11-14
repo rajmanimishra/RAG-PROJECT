@@ -1,0 +1,33 @@
+
+# Python
+.venv/
+**/.venv/
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# ChromaDB
+chroma-db/
+**/chroma-db/
+
+# Uploaded files
+uploads/
+**/uploads/
+
+# RAG session data
+.rag_sessions/
+**/.rag_sessions/
+
+# Uploaded and extracted documents
+uploads/
+**/uploads/ 
