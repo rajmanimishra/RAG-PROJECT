@@ -1,22 +1,18 @@
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
 import os
-import shutil
-import threading
-import time
+import sys
 import uuid
-from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass, field
+from array import array
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
-from typing import Iterator
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -24,24 +20,35 @@ from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
-from starlette.concurrency import run_in_threadpool
+from upstash_redis import Redis
 
 
+# Load the local project .env during development.
+# In Vercel, configure these values in Project Settings > Environment Variables.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 SESSION_TTL_SECONDS = 30 * 60
-CLEANUP_INTERVAL_SECONDS = 60
-MAX_FILE_BYTES = 10 * 1024 * 1024
-MAX_BATCH_BYTES = 25 * 1024 * 1024
+
+# Vercel Functions have a 4.5 MB request-body limit.
+# Keep the actual file payload at 4 MB to leave room for multipart overhead.
+MAX_FILE_BYTES = 4 * 1024 * 1024
+MAX_BATCH_BYTES = 4 * 1024 * 1024
+
 MAX_DOCUMENT_CHARS = 1_000_000
 MAX_PASTED_TEXT_CHARS = 500_000
-SESSION_ROOT = Path(
-    os.getenv("RAG_TEMP_DIR", str(PROJECT_ROOT / ".rag_sessions"))
-).resolve()
+
+# gemini-embedding-001 returns 3072 dimensions by default.
+VECTOR_DIMENSION = 3072
+VECTOR_METRIC = "COSINE"
+VECTOR_TOP_K = 4
+VECTOR_BATCH_SIZE = 20
+
+KEY_PREFIX = "rag:session"
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rag_api")
+
 
 chat_prompt = ChatPromptTemplate.from_messages(
     [
@@ -59,7 +66,11 @@ Document context:
         ("human", "{question}"),
     ]
 )
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=150,
+)
 
 
 class SessionResponse(BaseModel):
@@ -86,108 +97,120 @@ class AnswerResponse(BaseModel):
     sources: list[str]
 
 
-@dataclass
-class SessionState:
-    session_id: str
-    directory: Path
-    last_activity: float = field(default_factory=time.monotonic)
-    vectorstore: Chroma | None = None
-    document_count: int = 0
-    chunk_count: int = 0
-    sources: list[str] = field(default_factory=list)
-    lock: threading.Lock = field(default_factory=threading.Lock)
+_redis_client: Redis | None = None
 
 
-class SessionManager:
-    def __init__(self) -> None:
-        self._sessions: dict[str, SessionState] = {}
-        self._lock = threading.RLock()
+def get_redis() -> Redis:
+    """Create the Upstash Redis HTTP client once per warm function instance."""
+    global _redis_client
 
-    def create(self) -> SessionState:
-        session_id = str(uuid.uuid4())
-        directory = SESSION_ROOT / f"session-{session_id}"
-        (directory / "uploads").mkdir(parents=True, exist_ok=False)
-        (directory / "extracted").mkdir()
-        state = SessionState(session_id=session_id, directory=directory)
-        with self._lock:
-            self._sessions[session_id] = state
-        return state
+    if _redis_client is None:
+        url = os.getenv("UPSTASH_REDIS_REST_URL")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-    @contextmanager
-    def use(self, session_id: str) -> Iterator[SessionState]:
-        with self._lock:
-            state = self._sessions.get(session_id)
-            if state is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="This session has expired or does not exist. Start a new session.",
-                )
-            state.lock.acquire()
-            state.last_activity = time.monotonic()
-        try:
-            yield state
-        finally:
-            state.last_activity = time.monotonic()
-            state.lock.release()
+        if not url or not token:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Server configuration is missing "
+                    "UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN."
+                ),
+            )
 
-    def cleanup_expired(self) -> None:
-        now = time.monotonic()
-        expired: list[SessionState] = []
-        with self._lock:
-            for session_id, state in list(self._sessions.items()):
-                if now - state.last_activity < SESSION_TTL_SECONDS:
-                    continue
-                state.lock.acquire()
-                if time.monotonic() - state.last_activity >= SESSION_TTL_SECONDS:
-                    self._sessions.pop(session_id, None)
-                    expired.append(state)
-                else:
-                    state.lock.release()
-        for state in expired:
-            shutil.rmtree(state.directory, ignore_errors=False)
-            logger.info("Expired inactive session %s", state.session_id)
+        _redis_client = Redis(
+            url=url,
+            token=token,
+            allow_telemetry=False,
+        )
 
-    def shutdown(self) -> None:
-        with self._lock:
-            sessions = list(self._sessions.values())
-            self._sessions.clear()
-        for state in sessions:
-            with state.lock:
-                shutil.rmtree(state.directory, ignore_errors=False)
+    return _redis_client
 
 
-sessions = SessionManager()
-
-
-def required_api_key(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
+@lru_cache(maxsize=1)
+def make_embeddings() -> GoogleGenerativeAIEmbeddings:
+    if not os.getenv("GOOGLE_API_KEY"):
         raise HTTPException(
             status_code=503,
-            detail=f"Server configuration is missing the {name} environment variable.",
+            detail="Server configuration is missing the GOOGLE_API_KEY environment variable.",
         )
-    return value
 
-
-def make_embeddings() -> GoogleGenerativeAIEmbeddings:
-    required_api_key("GOOGLE_API_KEY")
     return GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 
 
 def make_llm() -> ChatGroq:
-    required_api_key("GROQ_API_KEY")
-    return ChatGroq(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"))
+    if not os.getenv("GROQ_API_KEY"):
+        raise HTTPException(
+            status_code=503,
+            detail="Server configuration is missing the GROQ_API_KEY environment variable.",
+        )
+
+    return ChatGroq(
+        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+    )
+
+
+def session_meta_key(session_id: str) -> str:
+    return f"{KEY_PREFIX}:{session_id}:meta"
+
+
+def session_chunks_key(session_id: str) -> str:
+    return f"{KEY_PREFIX}:{session_id}:chunks"
+
+
+def session_vectors_key(session_id: str) -> str:
+    return f"{KEY_PREFIX}:{session_id}:vectors"
+
+
+def get_session(session_id: str) -> dict:
+    """Load a session from Redis and refresh its 30-minute inactivity TTL."""
+    redis = get_redis()
+
+    meta_key = session_meta_key(session_id)
+    chunks_key = session_chunks_key(session_id)
+    vectors_key = session_vectors_key(session_id)
+
+    raw_metadata = redis.get(meta_key)
+    if not raw_metadata:
+        raise HTTPException(
+            status_code=404,
+            detail="This session has expired or does not exist. Start a new session.",
+        )
+
+    # A session is valid only while its vector index still exists.
+    if not redis.exists(vectors_key):
+        redis.delete(meta_key, chunks_key)
+        raise HTTPException(
+            status_code=404,
+            detail="This session has expired or does not exist. Start a new session.",
+        )
+
+    try:
+        metadata = json.loads(raw_metadata)
+    except (TypeError, json.JSONDecodeError) as exc:
+        logger.exception("Invalid session metadata for %s", session_id)
+        raise HTTPException(status_code=500, detail="Session data is invalid.") from exc
+
+    # Redis expires the session metadata, chunk hash, and vector index together.
+    redis.expire(meta_key, SESSION_TTL_SECONDS)
+    redis.expire(chunks_key, SESSION_TTL_SECONDS)
+    redis.expire(vectors_key, SESSION_TTL_SECONDS)
+
+    return metadata
 
 
 def clean_filename(filename: str | None) -> str:
     name = Path((filename or "").replace("\\", "/")).name.strip()
     if not name or name in {".", ".."}:
-        raise HTTPException(status_code=400, detail="Each uploaded file needs a valid filename.")
+        raise HTTPException(
+            status_code=400,
+            detail="Each uploaded file needs a valid filename.",
+        )
     return name
 
 
 def extract_upload(filename: str, content: bytes) -> list[Document]:
     suffix = Path(filename).suffix.lower()
+
     if suffix == ".txt":
         try:
             text = content.decode("utf-8-sig")
@@ -196,112 +219,195 @@ def extract_upload(filename: str, content: bytes) -> list[Document]:
                 status_code=400,
                 detail=f"{filename} must be a UTF-8 text file.",
             ) from exc
+
         if not text.strip():
-            raise HTTPException(status_code=400, detail=f"{filename} contains no readable text.")
+            raise HTTPException(
+                status_code=400,
+                detail=f"{filename} contains no readable text.",
+            )
+
         if len(text) > MAX_DOCUMENT_CHARS:
-            raise HTTPException(status_code=413, detail=f"{filename} contains too much text.")
-        return [Document(page_content=text, metadata={"source": filename})]
+            raise HTTPException(
+                status_code=413,
+                detail=f"{filename} contains too much text.",
+            )
+
+        return [
+            Document(
+                page_content=text,
+                metadata={"source": filename},
+            )
+        ]
+
     if suffix == ".pdf":
         try:
             reader = PdfReader(BytesIO(content))
+
             if reader.is_encrypted:
                 raise HTTPException(
                     status_code=400,
                     detail=f"{filename} is password-protected and cannot be processed.",
                 )
+
             documents = [
-                Document(page_content=page.extract_text() or "", metadata={
-                    "source": filename,
-                    "page": page_number,
-                })
+                Document(
+                    page_content=page.extract_text() or "",
+                    metadata={
+                        "source": filename,
+                        "page": page_number,
+                    },
+                )
                 for page_number, page in enumerate(reader.pages, start=1)
             ]
+
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{filename} is not a readable PDF.") from exc
+            raise HTTPException(
+                status_code=400,
+                detail=f"{filename} is not a readable PDF.",
+            ) from exc
+
         total_chars = sum(len(document.page_content) for document in documents)
+
         if total_chars > MAX_DOCUMENT_CHARS:
-            raise HTTPException(status_code=413, detail=f"{filename} contains too much text.")
-        if not any(document.page_content.strip() for document in documents):
-            raise HTTPException(status_code=400, detail=f"{filename} contains no extractable text.")
-        return documents
-    raise HTTPException(status_code=400, detail=f"{filename} must be a PDF or TXT file.")
-
-
-def add_documents(state: SessionState, documents: list[Document], raw_files: list[tuple[str, bytes]]) -> None:
-    chunks = text_splitter.split_documents(documents)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No searchable text was found in the submitted content.")
-    new_files: list[Path] = []
-    try:
-        for filename, content in raw_files:
-            raw_path = state.directory / "uploads" / f"{uuid.uuid4()}{Path(filename).suffix.lower()}"
-            raw_path.write_bytes(content)
-            new_files.append(raw_path)
-        for document in documents:
-            extracted_path = state.directory / "extracted" / f"{uuid.uuid4()}.txt"
-            extracted_path.write_text(document.page_content, encoding="utf-8")
-            new_files.append(extracted_path)
-
-        if state.vectorstore is None:
-            state.vectorstore = Chroma.from_documents(
-                documents=chunks,
-                embedding=make_embeddings(),
-                persist_directory=str(state.directory / "chroma"),
-                collection_name=f"session_{state.session_id.replace('-', '')}",
+            raise HTTPException(
+                status_code=413,
+                detail=f"{filename} contains too much text.",
             )
-        else:
-            state.vectorstore.add_documents(chunks)
-        state.document_count += len(raw_files) if raw_files else 1
-        state.chunk_count += len(chunks)
+
+        if not any(document.page_content.strip() for document in documents):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{filename} contains no extractable text.",
+            )
+
+        return documents
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"{filename} must be a PDF or TXT file.",
+    )
+
+
+def vector_as_little_endian_bytes(values: list[float]) -> bytes:
+    """Pack embeddings compactly for Upstash Redis VECTOR.ADD."""
+    packed = array("f", values)
+
+    if sys.byteorder != "little":
+        packed.byteswap()
+
+    return packed.tobytes()
+
+
+def add_documents(
+    session_id: str,
+    metadata: dict,
+    documents: list[Document],
+    document_increment: int,
+) -> DocumentResponse:
+    chunks = text_splitter.split_documents(documents)
+
+    if not chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="No searchable text was found in the submitted content.",
+        )
+
+    redis = get_redis()
+    vectors_key = session_vectors_key(session_id)
+    chunks_key = session_chunks_key(session_id)
+    meta_key = session_meta_key(session_id)
+
+    try:
+        texts = [chunk.page_content for chunk in chunks]
+        embeddings = make_embeddings().embed_documents(texts)
+
+        if len(embeddings) != len(chunks):
+            raise RuntimeError("The embedding service returned an unexpected number of vectors.")
+
+        if embeddings and len(embeddings[0]) != VECTOR_DIMENSION:
+            raise RuntimeError(
+                "The embedding dimension does not match the Redis vector index."
+            )
+
+        vector_index = redis.vector.index(vectors_key)
+
+        # Batch vector and chunk writes to reduce HTTP round trips to Upstash.
+        for start in range(0, len(chunks), VECTOR_BATCH_SIZE):
+            batch_chunks = chunks[start : start + VECTOR_BATCH_SIZE]
+            batch_embeddings = embeddings[start : start + VECTOR_BATCH_SIZE]
+
+            pipeline = redis.pipeline()
+
+            for chunk, embedding in zip(batch_chunks, batch_embeddings):
+                chunk_id = str(uuid.uuid4())
+                chunk_payload = {
+                    "text": chunk.page_content,
+                    "source": chunk.metadata.get("source", "document"),
+                    "page": chunk.metadata.get("page"),
+                }
+
+                pipeline.vector.index(vectors_key).add(
+                    chunk_id,
+                    vector_as_little_endian_bytes(embedding),
+                )
+                pipeline.hset(
+                    chunks_key,
+                    chunk_id,
+                    json.dumps(chunk_payload, ensure_ascii=False),
+                )
+
+            pipeline.exec()
+
+        metadata["document_count"] += document_increment
+        metadata["chunk_count"] += len(chunks)
+
         for document in documents:
-            source = document.metadata["source"]
-            if source not in state.sources:
-                state.sources.append(source)
+            source = str(document.metadata.get("source", "document"))
+            if source not in metadata["sources"]:
+                metadata["sources"].append(source)
+
+        # Refresh all session keys after indexing.
+        pipeline = redis.pipeline()
+        pipeline.set(meta_key, json.dumps(metadata), ex=SESSION_TTL_SECONDS)
+        pipeline.expire(chunks_key, SESSION_TTL_SECONDS)
+        pipeline.expire(vectors_key, SESSION_TTL_SECONDS)
+        pipeline.exec()
+
+        return DocumentResponse(
+            document_count=metadata["document_count"],
+            chunk_count=metadata["chunk_count"],
+            sources=metadata["sources"].copy(),
+        )
+
     except HTTPException:
-        for path in new_files:
-            path.unlink(missing_ok=True)
         raise
     except Exception as exc:
-        for path in new_files:
-            path.unlink(missing_ok=True)
-        logger.exception("Failed to index submitted documents for session %s", state.session_id)
-        raise HTTPException(status_code=502, detail="Document indexing failed. Please try again.") from exc
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    SESSION_ROOT.mkdir(parents=True, exist_ok=True)
-    for directory in SESSION_ROOT.glob("session-*"):
-        if directory.is_dir():
-            shutil.rmtree(directory, ignore_errors=False)
-    cleanup_task = asyncio.create_task(cleanup_loop())
-    try:
-        yield
-    finally:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-        sessions.shutdown()
-
-
-async def cleanup_loop() -> None:
-    while True:
-        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
-        await run_in_threadpool(sessions.cleanup_expired)
+        logger.exception("Failed to index documents for session %s", session_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Document indexing failed. Check your API configuration and try again.",
+        ) from exc
 
 
 app = FastAPI(
     title="Session-isolated RAG API",
     description="Ask questions against temporary, session-scoped documents.",
-    lifespan=lifespan,
 )
+
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "https://rag-project-frontend-sigma.vercel.app,http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
@@ -310,51 +416,129 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    try:
+        get_redis().ping()
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Redis health check failed")
+        raise HTTPException(
+            status_code=503,
+            detail="The Redis connection is not available.",
+        ) from exc
 
 
 @app.post("/api/sessions", response_model=SessionResponse)
 def create_session() -> SessionResponse:
-    state = sessions.create()
+    redis = get_redis()
+    session_id = str(uuid.uuid4())
+
+    meta_key = session_meta_key(session_id)
+    chunks_key = session_chunks_key(session_id)
+    vectors_key = session_vectors_key(session_id)
+
+    metadata = {
+        "session_id": session_id,
+        "document_count": 0,
+        "chunk_count": 0,
+        "sources": [],
+    }
+
+    try:
+        # Every session receives its own Redis vector index.
+        redis.vector.create_index(
+            name=vectors_key,
+            dimension=VECTOR_DIMENSION,
+            metric=VECTOR_METRIC,
+        )
+
+        pipeline = redis.pipeline()
+        pipeline.set(meta_key, json.dumps(metadata), ex=SESSION_TTL_SECONDS)
+        pipeline.expire(vectors_key, SESSION_TTL_SECONDS)
+        pipeline.exec()
+
+    except Exception as exc:
+        logger.exception("Could not create Redis session %s", session_id)
+        try:
+            redis.vector.index(vectors_key).drop()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=503,
+            detail="Could not create a temporary session. Check the Upstash Redis configuration.",
+        ) from exc
+
     return SessionResponse(
-        session_id=state.session_id,
+        session_id=session_id,
         expires_in_seconds=SESSION_TTL_SECONDS,
     )
 
 
 @app.delete("/api/sessions/{session_id}", status_code=204)
 def delete_session(session_id: str) -> None:
-    with sessions._lock:
-        state = sessions._sessions.get(session_id)
-        if state is None:
-            raise HTTPException(status_code=404, detail="This session does not exist.")
-        state.lock.acquire()
-        sessions._sessions.pop(session_id, None)
+    redis = get_redis()
+    metadata = redis.get(session_meta_key(session_id))
+
+    if not metadata:
+        raise HTTPException(
+            status_code=404,
+            detail="This session does not exist.",
+        )
+
     try:
-        shutil.rmtree(state.directory, ignore_errors=False)
-    finally:
-        state.lock.release()
+        redis.vector.index(session_vectors_key(session_id)).drop()
+        redis.delete(
+            session_meta_key(session_id),
+            session_chunks_key(session_id),
+        )
+    except Exception as exc:
+        logger.exception("Could not delete session %s", session_id)
+        raise HTTPException(
+            status_code=502,
+            detail="The session could not be deleted. Please try again.",
+        ) from exc
 
 
-@app.post("/api/sessions/{session_id}/documents", response_model=DocumentResponse)
+@app.post(
+    "/api/sessions/{session_id}/documents",
+    response_model=DocumentResponse,
+)
 def upload_documents(
     session_id: str,
     files: list[UploadFile] = File(...),
 ) -> DocumentResponse:
     if not files:
-        raise HTTPException(status_code=400, detail="Choose at least one PDF or TXT file.")
+        raise HTTPException(
+            status_code=400,
+            detail="Choose at least one PDF or TXT file.",
+        )
+
     named_content: list[tuple[str, bytes]] = []
     total_bytes = 0
+
     try:
         for uploaded_file in files:
             filename = clean_filename(uploaded_file.filename)
             content = uploaded_file.file.read(MAX_FILE_BYTES + 1)
+
             if len(content) > MAX_FILE_BYTES:
-                raise HTTPException(status_code=413, detail=f"{filename} exceeds the 10 MB file limit.")
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{filename} exceeds the 4 MB file limit.",
+                )
+
             total_bytes += len(content)
+
             if total_bytes > MAX_BATCH_BYTES:
-                raise HTTPException(status_code=413, detail="The combined upload exceeds the 25 MB limit.")
+                raise HTTPException(
+                    status_code=413,
+                    detail="The combined upload exceeds the 4 MB request limit.",
+                )
+
             named_content.append((filename, content))
+
     finally:
         for uploaded_file in files:
             uploaded_file.file.close()
@@ -364,73 +548,148 @@ def upload_documents(
         for filename, content in named_content
         for document in extract_upload(filename, content)
     ]
-    with sessions.use(session_id) as state:
-        add_documents(state, documents, named_content)
-        return DocumentResponse(
-            document_count=state.document_count,
-            chunk_count=state.chunk_count,
-            sources=state.sources.copy(),
-        )
+
+    metadata = get_session(session_id)
+
+    return add_documents(
+        session_id=session_id,
+        metadata=metadata,
+        documents=documents,
+        document_increment=len(named_content),
+    )
 
 
-@app.post("/api/sessions/{session_id}/text", response_model=DocumentResponse)
+@app.post(
+    "/api/sessions/{session_id}/text",
+    response_model=DocumentResponse,
+)
 def add_text(session_id: str, request: TextRequest) -> DocumentResponse:
     if not request.text.strip():
-        raise HTTPException(status_code=400, detail="Pasted text cannot be blank.")
-    document = Document(
-        page_content=request.text,
-        metadata={"source": f"Pasted text {int(time.time())}"},
-    )
-    with sessions.use(session_id) as state:
-        add_documents(state, [document], [])
-        return DocumentResponse(
-            document_count=state.document_count,
-            chunk_count=state.chunk_count,
-            sources=state.sources.copy(),
+        raise HTTPException(
+            status_code=400,
+            detail="Pasted text cannot be blank.",
         )
 
+    metadata = get_session(session_id)
 
-@app.post("/api/sessions/{session_id}/questions", response_model=AnswerResponse)
-def ask_question(session_id: str, request: QuestionRequest) -> AnswerResponse:
+    document = Document(
+        page_content=request.text,
+        metadata={"source": "Pasted text"},
+    )
+
+    return add_documents(
+        session_id=session_id,
+        metadata=metadata,
+        documents=[document],
+        document_increment=1,
+    )
+
+
+@app.post(
+    "/api/sessions/{session_id}/questions",
+    response_model=AnswerResponse,
+)
+def ask_question(
+    session_id: str,
+    request: QuestionRequest,
+) -> AnswerResponse:
     question = request.question.strip()
+
     if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be blank.")
-    with sessions.use(session_id) as state:
-        if state.vectorstore is None:
-            raise HTTPException(status_code=409, detail="Add a document before asking a question.")
-        try:
-            retriever = state.vectorstore.as_retriever(
-                search_type="mmr",
-                search_kwargs={"k": 4, "fetch_k": 10, "lambda_mult": 0.5},
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be blank.",
+        )
+
+    metadata = get_session(session_id)
+
+    if metadata["chunk_count"] == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Add a document before asking a question.",
+        )
+
+    redis = get_redis()
+    vectors_key = session_vectors_key(session_id)
+    chunks_key = session_chunks_key(session_id)
+
+    try:
+        query_vector = make_embeddings().embed_query(question)
+
+        matches = redis.vector.index(vectors_key).query(
+            vector=vector_as_little_endian_bytes(query_vector),
+            top_k=VECTOR_TOP_K,
+        )
+
+        if not matches:
+            return AnswerResponse(
+                answer="I don't know the answer based on the provided documents.",
+                sources=[],
             )
-            documents = retriever.invoke(question)
-            if not documents:
-                return AnswerResponse(
-                    answer="I don't know the answer based on the provided documents.",
-                    sources=[],
-                )
-            context = "\n\n".join(
-                f"[Source: {document.metadata.get('source', 'document')}"
-                f"{', page ' + str(document.metadata['page']) if 'page' in document.metadata else ''}]\n"
-                f"{document.page_content}"
-                for document in documents
+
+        match_ids = [match.id for match in matches]
+        stored_chunks = redis.hmget(chunks_key, *match_ids)
+
+        retrieved_chunks: list[dict] = []
+        for raw_chunk in stored_chunks:
+            if not raw_chunk:
+                continue
+
+            try:
+                retrieved_chunks.append(json.loads(raw_chunk))
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("Skipping an unreadable chunk in session %s", session_id)
+
+        if not retrieved_chunks:
+            return AnswerResponse(
+                answer="I don't know the answer based on the provided documents.",
+                sources=[],
             )
-            response = (chat_prompt | make_llm()).invoke(
-                {"context": context, "question": question}
+
+        context_parts = []
+        for chunk in retrieved_chunks:
+            source = chunk.get("source", "document")
+            page = chunk.get("page")
+
+            source_label = f"[Source: {source}"
+            if page is not None:
+                source_label += f", page {page}"
+            source_label += "]"
+
+            context_parts.append(
+                f"{source_label}\n{chunk.get('text', '')}"
             )
-            answer = response.content
-            if not isinstance(answer, str):
-                answer = str(answer)
-            sources = list(dict.fromkeys(
-                str(document.metadata.get("source", "document"))
-                for document in documents
-            ))
-            return AnswerResponse(answer=answer, sources=sources)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.exception("Question answering failed for session %s", session_id)
-            raise HTTPException(
-                status_code=502,
-                detail="The answer could not be generated. Check your API configuration and try again.",
-            ) from exc
+
+        context = "\n\n".join(context_parts)
+
+        response = (chat_prompt | make_llm()).invoke(
+            {
+                "context": context,
+                "question": question,
+            }
+        )
+
+        answer = response.content
+        if not isinstance(answer, str):
+            answer = str(answer)
+
+        sources = list(
+            dict.fromkeys(
+                str(chunk.get("source", "document"))
+                for chunk in retrieved_chunks
+            )
+        )
+
+        return AnswerResponse(
+            answer=answer,
+            sources=sources,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Question answering failed for session %s", session_id)
+        raise HTTPException(
+            status_code=502,
+            detail="The answer could not be generated. Check your API configuration and try again.",
+        ) from exc
