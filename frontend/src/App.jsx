@@ -1,5 +1,34 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
+const CITATION_STOP_WORDS = new Set(
+  "about after again all also am an and are as at be been before being but by can could did do does for from had has have he her here him his how i if in into is it its may me might more most must my no nor not of on or our out over she should so some than that the their them then there these they this those through to too under up us was we were what when where which who why will with would you your".split(" ")
+);
+
+function renderCitationExcerpt(excerpt, answer) {
+  const answerTerms = new Set(
+    (answer.match(/[\p{L}\p{N}]{4,}/gu) || [])
+      .map((word) => word.toLowerCase())
+      .filter((word) => !CITATION_STOP_WORDS.has(word))
+  );
+  const parts = [];
+  const wordPattern = /[\p{L}\p{N}]+/gu;
+  let previousIndex = 0;
+  let match;
+
+  while ((match = wordPattern.exec(excerpt)) !== null) {
+    parts.push(excerpt.slice(previousIndex, match.index));
+    const word = match[0];
+    parts.push(
+      answerTerms.has(word.toLowerCase())
+        ? <mark key={match.index} className="bg-[#f7e7a8] text-inherit underline decoration-[#9a6b00] decoration-2 underline-offset-2">{word}</mark>
+        : word
+    );
+    previousIndex = wordPattern.lastIndex;
+  }
+
+  parts.push(excerpt.slice(previousIndex));
+  return parts;
+}
 
 async function request(path, options = {}) {
   let response;
@@ -42,6 +71,7 @@ function App() {
   const [pastedText, setPastedText] = useState("");
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
+  const [cacheStats, setCacheStats] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const fileInput = useRef(null);
@@ -108,7 +138,15 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: prompt }),
       });
-      setMessages((current) => [...current, { role: "assistant", text: result.answer, sources: result.sources }]);
+      setCacheStats(result.cache_stats);
+      setMessages((current) => [...current, {
+        role: "assistant",
+        text: result.answer,
+        sources: result.sources,
+        citations: result.citations,
+        cacheStatus: result.cache_status,
+        responseTimeMs: result.response_time_ms,
+      }]);
     } catch (reason) {
       setError(reason.message);
     } finally {
@@ -126,6 +164,7 @@ function App() {
       }
       setDocuments(null);
       setMessages([]);
+      setCacheStats(null);
       setFiles([]);
       setPastedText("");
       await startSession();
@@ -225,6 +264,15 @@ function App() {
             <div><p className="section-label">DOCUMENT ASSISTANT</p><h2 className="mt-1 font-display text-lg font-bold">Ask your documents</h2></div>
             <div className="flex items-center gap-1.5 rounded-full bg-[#f4f6f3] px-3 py-1.5 text-[11px] font-semibold text-muted"><Icon name="clock" size={14} /> Auto-delete · 30 min idle</div>
           </div>
+          {cacheStats && (
+            <div className="border-b border-[#edf0ec] px-5 py-2 text-[11px] leading-5 text-muted sm:px-7" aria-live="polite">
+              Cache: {cacheStats.total_cache_hits} hits · {cacheStats.total_cache_misses} misses ·
+              {` ${cacheStats.avoided_llm_calls} LLM calls / ${cacheStats.avoided_vector_searches} searches avoided · `}
+              {cacheStats.cache_hit_rate.toFixed(1)}% hit rate ·
+              {` est. $${cacheStats.estimated_api_cost_saved_usd.toFixed(6)} saved · `}
+              avg {cacheStats.average_cache_hit_response_ms.toFixed(0)} ms hit / {cacheStats.average_cache_miss_response_ms.toFixed(0)} ms miss
+            </div>
+          )}
 
           <div className="flex flex-1 flex-col overflow-y-auto p-5 sm:p-8">
             {messages.length === 0 ? (
@@ -240,13 +288,32 @@ function App() {
                 {messages.map((message, index) => (
                   <article className={message.role === "user" ? "ml-auto max-w-[88%]" : "max-w-[94%]"} key={`${message.role}-${index}`}>
                     <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-[#8b9791]">{message.role === "user" ? "You" : "Grounded"}</p>
+                    {message.cacheStatus && <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-forest">{message.cacheStatus} · {message.responseTimeMs} ms</p>}
                     <div className={message.role === "user" ? "rounded-2xl rounded-tr-sm bg-forest px-4 py-3 text-sm leading-6 text-white" : "rounded-2xl rounded-tl-sm bg-[#f4f6f3] px-4 py-3 text-sm leading-6 text-ink"}>
                       <p className="whitespace-pre-wrap">{message.text}</p>
-                      {message.sources?.length > 0 && <p className="mt-3 border-t border-[#dfe5df] pt-2 text-[11px] text-muted">Sources: {message.sources.join(", ")}</p>}
+                      {message.citations?.length > 0 ? (
+                        <div className="mt-3 space-y-3 border-t border-[#dfe5df] pt-3">
+                          <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-muted">Retrieved passages · matching answer words underlined</p>
+                          {message.citations.map((citation, citationIndex) => (
+                            <figure key={`${citation.source}-${citation.page}-${citationIndex}`}>
+                              <figcaption className="mb-1 text-[11px] font-semibold text-forest">
+                                {citation.source}{citation.page != null ? ` · page ${citation.page}` : ""}
+                              </figcaption>
+                              <blockquote className="whitespace-pre-wrap border-l-2 border-[#d9c99a] pl-3 text-xs leading-5 text-[#52615a]">
+                                {renderCitationExcerpt(citation.excerpt, message.text)}
+                              </blockquote>
+                            </figure>
+                          ))}
+                        </div>
+                      ) : message.sources?.length > 0 && (
+                        <p className="mt-3 border-t border-[#dfe5df] pt-2 text-[11px] text-muted">
+                          Sources: {message.sources.join(", ")}
+                        </p>
+                      )}
                     </div>
                   </article>
                 ))}
-                {busy && <div className="flex items-center gap-2 text-xs text-muted"><span className="typing-dot" /><span className="typing-dot animation-delay-150" /><span className="typing-dot animation-delay-300" /> Searching your documents…</div>}
+                {busy && <div className="flex items-center gap-2 text-xs text-muted"><span className="typing-dot" /><span className="typing-dot animation-delay-150" /><span className="typing-dot animation-delay-300" /> Checking your sources…</div>}
               </div>
             )}
           </div>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 import uuid
@@ -9,6 +10,7 @@ from array import array
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
+from time import perf_counter
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -22,6 +24,21 @@ from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from upstash_redis import Redis
 
+if __package__:
+    from .cache import (
+        cosine_similarity,
+        normalize_question,
+        question_cache_field,
+        semantic_match_is_safe,
+    )
+else:
+    from cache import (
+        cosine_similarity,
+        normalize_question,
+        question_cache_field,
+        semantic_match_is_safe,
+    )
+
 
 # Load the local project .env during development.
 # In Vercel, configure these values in Project Settings > Environment Variables.
@@ -29,6 +46,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 SESSION_TTL_SECONDS = 30 * 60
+SEMANTIC_CACHE_ENABLED = os.getenv(
+    "RAG_SEMANTIC_CACHE_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes"}
+SEMANTIC_CACHE_THRESHOLD = 0.985
 
 # Vercel Functions have a 4.5 MB request-body limit.
 # Keep the actual file payload at 4 MB to leave room for multipart overhead.
@@ -92,9 +113,30 @@ class DocumentResponse(BaseModel):
     sources: list[str]
 
 
+class CitationResponse(BaseModel):
+    source: str
+    page: int | None = None
+    excerpt: str
+
+
+class CacheStatsResponse(BaseModel):
+    total_cache_hits: int
+    total_cache_misses: int
+    avoided_llm_calls: int
+    avoided_vector_searches: int
+    estimated_api_cost_saved_usd: float
+    cache_hit_rate: float
+    average_cache_hit_response_ms: float
+    average_cache_miss_response_ms: float
+
+
 class AnswerResponse(BaseModel):
     answer: str
     sources: list[str]
+    citations: list[CitationResponse]
+    cache_status: str
+    response_time_ms: float
+    cache_stats: CacheStatsResponse
 
 
 _redis_client: Redis | None = None
@@ -161,6 +203,14 @@ def session_vectors_key(session_id: str) -> str:
     return f"{KEY_PREFIX}:{session_id}:vectors"
 
 
+def session_answers_key(session_id: str) -> str:
+    return f"{KEY_PREFIX}:{session_id}:answers"
+
+
+def session_cache_stats_key(session_id: str) -> str:
+    return f"{KEY_PREFIX}:{session_id}:cache-stats"
+
+
 def get_session(session_id: str) -> dict:
     """Load a session from Redis and refresh its 30-minute inactivity TTL."""
     redis = get_redis()
@@ -178,7 +228,12 @@ def get_session(session_id: str) -> dict:
 
     # A session is valid only while its vector index still exists.
     if not redis.exists(vectors_key):
-        redis.delete(meta_key, chunks_key)
+        redis.delete(
+            meta_key,
+            chunks_key,
+            session_answers_key(session_id),
+            session_cache_stats_key(session_id),
+        )
         raise HTTPException(
             status_code=404,
             detail="This session has expired or does not exist. Start a new session.",
@@ -190,10 +245,16 @@ def get_session(session_id: str) -> dict:
         logger.exception("Invalid session metadata for %s", session_id)
         raise HTTPException(status_code=500, detail="Session data is invalid.") from exc
 
+    if "document_version" not in metadata:
+        metadata["document_version"] = uuid.uuid4().hex
+        redis.set(meta_key, json.dumps(metadata), ex=SESSION_TTL_SECONDS)
+
     # Redis expires the session metadata, chunk hash, and vector index together.
     redis.expire(meta_key, SESSION_TTL_SECONDS)
     redis.expire(chunks_key, SESSION_TTL_SECONDS)
     redis.expire(vectors_key, SESSION_TTL_SECONDS)
+    redis.expire(session_answers_key(session_id), SESSION_TTL_SECONDS)
+    redis.expire(session_cache_stats_key(session_id), SESSION_TTL_SECONDS)
 
     return metadata
 
@@ -320,6 +381,11 @@ def add_documents(
     meta_key = session_meta_key(session_id)
 
     try:
+        # A document update changes the retrieval context, so old answers cannot be reused.
+        metadata["document_version"] = uuid.uuid4().hex
+        redis.delete(session_answers_key(session_id))
+        redis.set(meta_key, json.dumps(metadata), ex=SESSION_TTL_SECONDS)
+
         texts = [chunk.page_content for chunk in chunks]
         embeddings = make_embeddings().embed_documents(texts)
 
@@ -443,6 +509,7 @@ def create_session() -> SessionResponse:
         "document_count": 0,
         "chunk_count": 0,
         "sources": [],
+        "document_version": uuid.uuid4().hex,
     }
 
     try:
@@ -492,6 +559,8 @@ def delete_session(session_id: str) -> None:
         redis.delete(
             session_meta_key(session_id),
             session_chunks_key(session_id),
+            session_answers_key(session_id),
+            session_cache_stats_key(session_id),
         )
     except Exception as exc:
         logger.exception("Could not delete session %s", session_id)
@@ -585,6 +654,196 @@ def add_text(session_id: str, request: TextRequest) -> DocumentResponse:
     )
 
 
+def _cache_entry_from_raw(raw_entry: str | bytes | None) -> dict | None:
+    if not raw_entry:
+        return None
+    try:
+        entry = json.loads(raw_entry)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        logger.warning("Skipping a malformed cached answer")
+        return None
+    if (
+        not isinstance(entry, dict)
+        or not isinstance(entry.get("answer"), str)
+        or not isinstance(entry.get("sources"), list)
+        or not all(isinstance(source, str) for source in entry["sources"])
+        or not isinstance(entry.get("citations"), list)
+        or not all(
+            isinstance(citation, dict)
+            and isinstance(citation.get("source"), str)
+            and (
+                citation.get("page") is None
+                or isinstance(citation.get("page"), int)
+            )
+            and isinstance(citation.get("excerpt"), str)
+            for citation in entry["citations"]
+        )
+    ):
+        logger.warning("Skipping a malformed cached answer")
+        return None
+    return entry
+
+
+def _estimated_call_cost_micros() -> int:
+    try:
+        cost = float(os.getenv("RAG_ESTIMATED_LLM_COST_PER_CALL_USD", "0"))
+    except ValueError:
+        logger.warning("Invalid RAG_ESTIMATED_LLM_COST_PER_CALL_USD; using zero")
+        return 0
+    if not math.isfinite(cost) or cost < 0:
+        logger.warning("Invalid estimated LLM call cost; using zero")
+        return 0
+    return round(cost * 1_000_000)
+
+
+def _record_cache_request(
+    redis: Redis,
+    session_id: str,
+    cache_hit: bool,
+    elapsed_seconds: float,
+    avoided_llm_call: bool = False,
+) -> None:
+    stats_key = session_cache_stats_key(session_id)
+    latency_field = "cache_hit_latency_us" if cache_hit else "cache_miss_latency_us"
+    increments = {
+        "cache_hits" if cache_hit else "cache_misses": 1,
+        latency_field: max(0, round(elapsed_seconds * 1_000_000)),
+    }
+    if cache_hit:
+        increments["avoided_vector_searches"] = 1
+    if cache_hit and avoided_llm_call:
+        increments["avoided_llm_calls"] = 1
+        increments["estimated_api_cost_saved_micros"] = _estimated_call_cost_micros()
+
+    try:
+        pipeline = redis.pipeline()
+        for field, increment in increments.items():
+            if increment:
+                pipeline.hincrby(stats_key, field, increment)
+        pipeline.expire(stats_key, SESSION_TTL_SECONDS)
+        pipeline.exec()
+    except Exception:
+        logger.exception("Could not update cache statistics for session %s", session_id)
+
+
+def _read_cache_stats(redis: Redis, session_id: str) -> CacheStatsResponse:
+    zero_stats = CacheStatsResponse(
+        total_cache_hits=0,
+        total_cache_misses=0,
+        avoided_llm_calls=0,
+        avoided_vector_searches=0,
+        estimated_api_cost_saved_usd=0.0,
+        cache_hit_rate=0.0,
+        average_cache_hit_response_ms=0.0,
+        average_cache_miss_response_ms=0.0,
+    )
+    try:
+        raw_stats = redis.hgetall(session_cache_stats_key(session_id)) or {}
+        stats = {
+            key.decode() if isinstance(key, bytes) else key: int(value or 0)
+            for key, value in raw_stats.items()
+        }
+    except Exception:
+        logger.exception("Could not read cache statistics for session %s", session_id)
+        return zero_stats
+
+    hits = stats.get("cache_hits", 0)
+    misses = stats.get("cache_misses", 0)
+    total_requests = hits + misses
+    return CacheStatsResponse(
+        total_cache_hits=hits,
+        total_cache_misses=misses,
+        avoided_llm_calls=stats.get("avoided_llm_calls", 0),
+        avoided_vector_searches=stats.get("avoided_vector_searches", 0),
+        estimated_api_cost_saved_usd=(
+            stats.get("estimated_api_cost_saved_micros", 0) / 1_000_000
+        ),
+        cache_hit_rate=hits / total_requests * 100 if total_requests else 0.0,
+        average_cache_hit_response_ms=(
+            stats.get("cache_hit_latency_us", 0) / hits / 1000 if hits else 0.0
+        ),
+        average_cache_miss_response_ms=(
+            stats.get("cache_miss_latency_us", 0) / misses / 1000 if misses else 0.0
+        ),
+    )
+
+
+def _finish_answer(
+    redis: Redis,
+    session_id: str,
+    answer: str,
+    sources: list[str],
+    citations: list[CitationResponse],
+    cache_hit: bool,
+    started_at: float,
+    avoided_llm_call: bool = False,
+) -> AnswerResponse:
+    elapsed_seconds = perf_counter() - started_at
+    _record_cache_request(
+        redis,
+        session_id,
+        cache_hit,
+        elapsed_seconds,
+        avoided_llm_call=avoided_llm_call,
+    )
+    return AnswerResponse(
+        answer=answer,
+        sources=sources,
+        citations=citations,
+        cache_status="CACHE HIT" if cache_hit else "CACHE MISS",
+        response_time_ms=round(elapsed_seconds * 1000, 2),
+        cache_stats=_read_cache_stats(redis, session_id),
+    )
+
+
+def _store_answer_cache(
+    redis: Redis,
+    session_id: str,
+    document_version: str,
+    question: str,
+    cache_field: str,
+    answer: str,
+    sources: list[str],
+    citations: list[CitationResponse],
+    llm_called: bool,
+    query_vector: list[float] | None,
+) -> None:
+    entry = {
+        "document_version": document_version,
+        "question": normalize_question(question),
+        "answer": answer,
+        "sources": sources,
+        "citations": [
+            {
+                "source": citation.source,
+                "page": citation.page,
+                "excerpt": citation.excerpt,
+            }
+            for citation in citations
+        ],
+        "llm_called": llm_called,
+    }
+    if SEMANTIC_CACHE_ENABLED and query_vector is not None:
+        entry["embedding"] = query_vector
+
+    answers_key = session_answers_key(session_id)
+    try:
+        pipeline = redis.pipeline()
+        pipeline.hset(
+            answers_key,
+            cache_field,
+            json.dumps(entry, ensure_ascii=False),
+        )
+        pipeline.expire(answers_key, SESSION_TTL_SECONDS)
+        pipeline.exec()
+    except Exception:
+        logger.exception("Could not store cached answer for session %s", session_id)
+        try:
+            redis.delete(answers_key)
+        except Exception:
+            logger.exception("Could not clean up the answer cache for session %s", session_id)
+
+
 @app.post(
     "/api/sessions/{session_id}/questions",
     response_model=AnswerResponse,
@@ -593,6 +852,7 @@ def ask_question(
     session_id: str,
     request: QuestionRequest,
 ) -> AnswerResponse:
+    started_at = perf_counter()
     question = request.question.strip()
 
     if not question:
@@ -612,9 +872,89 @@ def ask_question(
     redis = get_redis()
     vectors_key = session_vectors_key(session_id)
     chunks_key = session_chunks_key(session_id)
+    document_version = metadata["document_version"]
+    answers_key = session_answers_key(session_id)
+    cache_field = question_cache_field(question, document_version)
+    query_vector: list[float] | None = None
 
     try:
-        query_vector = make_embeddings().embed_query(question)
+        try:
+            raw_entry = redis.hget(answers_key, cache_field)
+        except Exception:
+            logger.exception("Answer cache lookup failed for session %s", session_id)
+            raw_entry = None
+
+        cached_entry = _cache_entry_from_raw(raw_entry)
+        if (
+            cached_entry
+            and cached_entry.get("document_version") == document_version
+        ):
+            return _finish_answer(
+                redis,
+                session_id,
+                str(cached_entry.get("answer", "")),
+                list(cached_entry.get("sources", [])),
+                [
+                    CitationResponse(**citation)
+                    for citation in cached_entry.get("citations", [])
+                    if isinstance(citation, dict)
+                ],
+                cache_hit=True,
+                started_at=started_at,
+                avoided_llm_call=bool(cached_entry.get("llm_called")),
+            )
+
+        if SEMANTIC_CACHE_ENABLED:
+            query_vector = make_embeddings().embed_query(question)
+            try:
+                cached_entries = redis.hgetall(answers_key) or {}
+            except Exception:
+                logger.exception("Semantic answer cache lookup failed for session %s", session_id)
+                cached_entries = {}
+            if not isinstance(cached_entries, dict):
+                logger.warning("Skipping malformed semantic cache for session %s", session_id)
+                cached_entries = {}
+
+            best_match: dict | None = None
+            best_similarity = SEMANTIC_CACHE_THRESHOLD
+            for raw_cached_entry in cached_entries.values():
+                candidate = _cache_entry_from_raw(raw_cached_entry)
+                if (
+                    not candidate
+                    or candidate.get("document_version") != document_version
+                    or not isinstance(candidate.get("embedding"), list)
+                    or not semantic_match_is_safe(
+                        question,
+                        str(candidate.get("question", "")),
+                        query_vector,
+                        candidate["embedding"],
+                        SEMANTIC_CACHE_THRESHOLD,
+                    )
+                ):
+                    continue
+                similarity = cosine_similarity(query_vector, candidate["embedding"])
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match = candidate
+
+            if best_match is not None:
+                return _finish_answer(
+                    redis,
+                    session_id,
+                    str(best_match.get("answer", "")),
+                    list(best_match.get("sources", [])),
+                    [
+                        CitationResponse(**citation)
+                        for citation in best_match.get("citations", [])
+                        if isinstance(citation, dict)
+                    ],
+                    cache_hit=True,
+                    started_at=started_at,
+                    avoided_llm_call=bool(best_match.get("llm_called")),
+                )
+
+        if query_vector is None:
+            query_vector = make_embeddings().embed_query(question)
 
         matches = redis.vector.index(vectors_key).query(
             vector=vector_as_little_endian_bytes(query_vector),
@@ -622,9 +962,13 @@ def ask_question(
         )
 
         if not matches:
-            return AnswerResponse(
-                answer="I don't know the answer based on the provided documents.",
-                sources=[],
+            answer = "I don't know the answer based on the provided documents."
+            _store_answer_cache(
+                redis, session_id, document_version, question, cache_field,
+                answer, [], [], False, query_vector,
+            )
+            return _finish_answer(
+                redis, session_id, answer, [], [], False, started_at,
             )
 
         match_ids = [match.id for match in matches]
@@ -641,9 +985,13 @@ def ask_question(
                 logger.warning("Skipping an unreadable chunk in session %s", session_id)
 
         if not retrieved_chunks:
-            return AnswerResponse(
-                answer="I don't know the answer based on the provided documents.",
-                sources=[],
+            answer = "I don't know the answer based on the provided documents."
+            _store_answer_cache(
+                redis, session_id, document_version, question, cache_field,
+                answer, [], [], False, query_vector,
+            )
+            return _finish_answer(
+                redis, session_id, answer, [], [], False, started_at,
             )
 
         context_parts = []
@@ -679,10 +1027,40 @@ def ask_question(
                 for chunk in retrieved_chunks
             )
         )
-
-        return AnswerResponse(
-            answer=answer,
-            sources=sources,
+        citations = list(
+            dict.fromkeys(
+                (
+                    str(chunk.get("source", "document")),
+                    chunk.get("page"),
+                    str(chunk.get("text", "")),
+                )
+                for chunk in retrieved_chunks
+            )
+        )
+        citation_responses = [
+            CitationResponse(source=source, page=page, excerpt=excerpt)
+            for source, page, excerpt in citations
+        ]
+        _store_answer_cache(
+            redis,
+            session_id,
+            document_version,
+            question,
+            cache_field,
+            answer,
+            sources,
+            citation_responses,
+            True,
+            query_vector,
+        )
+        return _finish_answer(
+            redis,
+            session_id,
+            answer,
+            sources,
+            citation_responses,
+            False,
+            started_at,
         )
 
     except HTTPException:
